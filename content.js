@@ -68,6 +68,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   compare: false,
   quality: "high",
   interaction: "smooth",
+  // Sources at or above this intrinsic height are presented natively (no
+  // upscaling): "1080" | "1440" | "2160" | "display" (screen height) | "never".
+  bypassAt: "2160",
   // Frame interpolation (A/B toggles). Defaults: infra off; sub-options ready.
   fiInfra: false,
   fiEngine: "ifrnet",
@@ -107,6 +110,9 @@ function normalizeSettings(value = {}) {
     interaction: ["smooth", "balanced", "quality"].includes(value.interaction)
       ? value.interaction
       : DEFAULT_SETTINGS.interaction,
+    bypassAt: ["never", "1080", "1440", "2160", "display"].includes(value.bypassAt)
+      ? value.bypassAt
+      : DEFAULT_SETTINGS.bypassAt,
     ...fi,
     fiEngine: ((globalThis.VE_BUILD?.personal !== false ? ["analytic","classic","neural","ifrnet"] : ["analytic","classic"]).includes(value.fiEngine)) ? value.fiEngine : "ifrnet",
     fiModelRevision: typeof value.fiModelRevision === "string" ? value.fiModelRevision : "",
@@ -114,6 +120,28 @@ function normalizeSettings(value = {}) {
     fiDebug: [0, 1, 2, 3, 4].includes(Number(value.fiDebug)) ? Number(value.fiDebug) : 0,
     fiNeuralRevision: Number.isSafeInteger(value.fiNeuralRevision) ? value.fiNeuralRevision : 0,
   };
+}
+
+// --------------------------------------------------------------------------
+// Source-quality bypass (native presentation at or above a height)
+// --------------------------------------------------------------------------
+
+// Threshold in source pixels: 1080/1440/2160 are literal heights; "display"
+// uses the screen height; "never" (or anything invalid) never bypasses.
+function bypassThresholdPx(value, screenHeight = NaN) {
+  if (value === "never") return Infinity;
+  if (value === "display") {
+    const screen = Number(screenHeight);
+    return Number.isFinite(screen) && screen > 0 ? screen : Infinity;
+  }
+  const px = Number(value);
+  return Number.isFinite(px) && px > 0 ? px : Infinity;
+}
+
+// Only the spatial upscalers (FSR1/RAVU) are bypassed; Off/Native unchanged.
+function sourceShouldBypass(mode, videoHeight, thresholdPx) {
+  return (mode === "rcas" || mode === "ravu") &&
+    videoHeight > 0 && videoHeight >= thresholdPx;
 }
 
 // --------------------------------------------------------------------------
@@ -441,6 +469,7 @@ let hasVisibleVideo = true;
 let lastError = "";
 let status = "idle"; // "ok" | "tainted" | "error" | "no-webgl" | "no-video"
 let layoutDirty = true;
+let lastIntrinsicSize = "";
 let layoutRafScheduled = false;
 let rescanRafScheduled = false;
 let activePageListeners = false;
@@ -601,13 +630,37 @@ function isCurrentFeedSession(video, id = feedSessionId) {
 }
 
 function canRender() {
-  return settings.mode !== "off" && overlayVisible && hasVisibleVideo && (!currentVideo || currentVideo !== blockedVideo) &&
+  return settings.mode !== "off" && overlayVisible && hasVisibleVideo && !isSourceBypassed() &&
+    (!currentVideo || currentVideo !== blockedVideo) &&
     (!scrolling || settings.interaction !== "smooth") && videoInViewport &&
     (typeof document === "undefined" || !document.hidden);
 }
 
 function canShowOverlayFrame() {
   return canRender() && status === "ok";
+}
+
+// Resolved source-height threshold for this frame; Infinity disables bypass.
+function activeBypassThreshold() {
+  let screenHeight = NaN;
+  try {
+    screenHeight = window.screen && window.screen.height;
+  } catch (error) {
+    screenHeight = NaN;
+  }
+  return bypassThresholdPx(settings.bypassAt, screenHeight);
+}
+
+function isSourceBypassed() {
+  return Boolean(currentVideo) &&
+    sourceShouldBypass(settings.mode, currentVideo.videoHeight, activeBypassThreshold());
+}
+
+// The texture still describes a previous source (size change without a new
+// upload): the canvas backing store must not stay cleared after a re-fit.
+function textureStaleForVideo() {
+  return Boolean(currentVideo) &&
+    (textureWidth !== currentVideo.videoWidth || textureHeight !== currentVideo.videoHeight);
 }
 
 function effectiveRenderScale() {
@@ -2612,9 +2665,16 @@ function deactivateRenderer() {
 
 function activateRenderer(captureFrame = false) {
   if (!currentVideo || settings.mode === "off") return false;
+  attachActivePageListeners();
+  if (isSourceBypassed()) {
+    // Native presentation: no canvas, no GL context, no frame loop. The
+    // page-level 'resize' listener attached above re-evaluates when the
+    // source changes size (ABR switch up or down).
+    engageNativeBypass();
+    return true;
+  }
   if (!canvas && !createOverlay()) return false;
   attachCanvasTo(currentVideo);
-  attachActivePageListeners();
   observeVideoLayout();
   layoutDirty = true;
   if (!program || !rcasProgram) {
@@ -2725,8 +2785,35 @@ function videoOverlayGeometry(video, overlay) {
   };
 }
 
+// Sources at or above the bypass threshold are presented natively: the frame
+// loop stops, the canvas hides and the <video> paints itself again.
+function engageNativeBypass() {
+  cancelScheduledFrame();
+  cancelFiMid();
+  resetFiPairState();
+  resetVideoFrameHistory();
+  activePipeline = "Bypassed — native";
+  // Native presentation is unconditional: hide the overlay here instead of
+  // trusting the visibility cache, which can already read "hidden" for a
+  // canvas that is still painted (e.g. after a source change re-created it).
+  if (canvas) {
+    updateCanvasDataset(activePipeline, "");
+    canvas.style.display = "none";
+    canvas.style.visibility = "hidden";
+  }
+  lastCanvasVisibility = "hidden";
+  updateCanvasVisibility();
+}
+
 function syncLayout() {
   if (stopped || !currentVideo || !canvas || !canvas.parentNode) return;
+  // A new intrinsic size (different stream, quality switch, new clip) must
+  // re-fit even when the element box itself did not change.
+  const intrinsicSize = currentVideo.videoWidth + "x" + currentVideo.videoHeight;
+  if (intrinsicSize !== lastIntrinsicSize) {
+    lastIntrinsicSize = intrinsicSize;
+    layoutDirty = true;
+  }
   if (!layoutDirty) return;
   const parent = currentVideo.parentElement;
   if (!parent) return;
@@ -2867,7 +2954,15 @@ function fiDrawDirect(options, drawKind, cpuStart) {
 function draw(options = {}) {
   if (stopped || !canRender() ||
       !currentVideo || !currentVideo.parentElement || !gl || !program || !rcasProgram || !canvas.parentNode) return;
-  const drawKind = frameDrawKind(options);
+  let drawKind = frameDrawKind(options);
+  // A redraw whose texture no longer matches the video's source size (ABR
+  // switch, new clip, decoder reconfig) must not be skipped: the canvas
+  // backing store may already have been re-created by the re-fit and skipping
+  // would leave it cleared. Capture the current frame so the new source
+  // replaces the stale pixels and the texture is reallocated at the new size.
+  if (drawKind === "redraw" && currentVideo.readyState >= 2 && textureStaleForVideo()) {
+    drawKind = "capture";
+  }
   if (drawKind === "capture" && currentVideo.readyState < 2) {
     status = "buffering";
     resetFiPairState();
@@ -2968,11 +3063,26 @@ function draw(options = {}) {
   } else if (drawKind === "capture") {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
+    // Drain stale errors so this upload's own result is unambiguous.
+    while (gl.getError() !== gl.NO_ERROR) { /* clear */ }
     try {
       texture = acquireSpatialTexture("source", currentVideo.videoWidth, currentVideo.videoHeight, currentVideo).texture;
       sourceTex = texture;
       textureWidth = currentVideo.videoWidth;
       textureHeight = currentVideo.videoHeight;
+      if (gl.getError() !== gl.NO_ERROR) {
+        // The frame could not be uploaded (element switched sources
+        // mid-upload). Forget the size bookkeeping so the next capture
+        // reallocates the texture instead of failing forever or writing
+        // into a stale, differently sized storage.
+        if (gpuQuery) {
+          gl.endQuery(timerExt.TIME_ELAPSED_EXT);
+          gl.deleteQuery(gpuQuery);
+        }
+        textureWidth = 0;
+        textureHeight = 0;
+        return;
+      }
     } catch (e) {
       if (gpuQuery) {
         gl.endQuery(timerExt.TIME_ELAPSED_EXT);
@@ -3147,6 +3257,7 @@ function draw(options = {}) {
       gl.drawArrays(gl.TRIANGLES, 0, 3);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, canvas.width, canvas.height);
       gl.useProgram(rcasProgram);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, upscaledTexture);
@@ -3403,6 +3514,15 @@ function cancelScheduledFrame(video = currentVideo) {
   // mid-frame FI is independent of rVFC handle; cancel on full stop paths only
 }
 
+// A re-fit (window/element/fullscreen resize, quality change) resets the canvas
+// backing store, and a paused video emits no rVFC — repaint the frame it still
+// holds, or the canvas stays blank until playback resumes.
+function redrawPausedFrame() {
+  if (!currentVideo || currentVideo.readyState < 2) return;
+  if (!currentVideo.paused && !textureStaleForVideo()) return;
+  draw({ newVideoFrame: true });
+}
+
 function scheduleLayoutSync() {
   // Reposition the canvas while paused too (theater/resize without a new frame).
   if (stopped || layoutRafScheduled || !currentVideo) return;
@@ -3412,7 +3532,13 @@ function scheduleLayoutSync() {
     if (currentVideo) {
       const width = canvas?.width, height = canvas?.height;
       syncLayout();
-      if (canvas && (canvas.width !== width || canvas.height !== height)) draw();
+      const resized = Boolean(canvas) &&
+        (canvas.width !== width || canvas.height !== height);
+      if (currentVideo.paused || textureStaleForVideo()) {
+        redrawPausedFrame();
+      } else if (resized) {
+        draw();
+      }
     }
   });
 }
@@ -3541,6 +3667,21 @@ function handleVideoReset(event) {
     textureHeight = 0;
     metricReport.videoFps = 0;
     layoutDirty = true;
+  }
+  if (event.type === "resize") {
+    // A rendition switch (adaptive bitrate), a new clip or a decoder reconfig
+    // changes the intrinsic size in both directions. At or above the bypass
+    // threshold the native video takes over; a drop below it re-engages the
+    // renderer, so ABR switches are re-evaluated either way.
+    if (isSourceBypassed()) {
+      engageNativeBypass();
+      return;
+    }
+    if (!canvas) {
+      activateRenderer(true);
+      return;
+    }
+    attachCanvasTo(currentVideo);
   }
   status = "buffering";
   updateCanvasVisibility();
@@ -3740,6 +3881,7 @@ function applySettings(value) {
   if ((!settings.fiInfra && previous.fiInfra) || engineChanged) fiReleaseGpu();
   const modeChanged = settings.mode !== previous.mode;
   const qualityChanged = settings.quality !== previous.quality;
+  const bypassChanged = settings.bypassAt !== previous.bypassAt;
   const visualChanged = settings.strength !== previous.strength ||
     settings.compare !== previous.compare || settings.protectNoise !== previous.protectNoise;
   const outlineChanged = settings.outline !== previous.outline;
@@ -3793,7 +3935,7 @@ function applySettings(value) {
   if (previous.mode === "off") {
     status = "idle";
     rescan();
-  } else if (modeChanged || qualityChanged) {
+  } else if (modeChanged || qualityChanged || bypassChanged) {
     activateRenderer();
   } else if (interactionChanged || fiChanged) {
     layoutDirty = true;
@@ -3835,6 +3977,7 @@ function snapshot() {
   }
   gpuTimingUntil = now + 1200;
   publishMetrics(now);
+  const bypassThreshold = activeBypassThreshold();
   return {
     status,
     lastError,
@@ -3845,6 +3988,10 @@ function snapshot() {
     hasVisibleVideo,
     videoInViewport,
     canRender: canRender(),
+    bypassed: isSourceBypassed(),
+    bypassThreshold: Number.isFinite(bypassThreshold) ? bypassThreshold : 0,
+    sourceWidth: currentVideo ? currentVideo.videoWidth : 0,
+    sourceHeight: currentVideo ? currentVideo.videoHeight : 0,
     canvasWidth: canvas ? canvas.width : 0,
     canvasHeight: canvas ? canvas.height : 0,
     pipeline: activePipeline,
@@ -3979,8 +4126,9 @@ function stop() {
 // --------------------------------------------------------------------------
 
 function runSpike() {
-  if (window.top !== window) return;
-
+  // Runs in every frame (manifest: all_frames): each frame detects and
+  // processes its own <video>, including players inside cross-origin
+  // iframes. The popup aggregates the per-frame states.
   // Avoid duplication if the extension is manually injected more than once.
   if (window.__fvEnhancerLoaded) {
     log("already loaded on this page — ignoring reinjection");
@@ -3989,11 +4137,29 @@ function runSpike() {
   window.__fvEnhancerLoaded = true;
 
   ext.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message && message.type === "fv-status") sendResponse(snapshot());
-    if (message && message.type === "fv-toggle") sendResponse(toggleOverlay());
-    if (message && message.type === "fv-settings") {
+    if (!message || typeof message.type !== "string") return;
+    let state = null;
+    if (message.type === "fv-status") {
+      state = snapshot();
+    } else if (message.type === "fv-toggle") {
+      state = toggleOverlay();
+    } else if (message.type === "fv-settings") {
       applySettings({ ...settings, ...message.settings });
-      sendResponse(snapshot());
+      state = snapshot();
+    }
+    if (!state) return;
+    sendResponse(state);
+    // tabs.sendMessage resolves with only ONE frame's answer when several
+    // frames respond, and a video-less top frame can win that race. Pushing the
+    // state from every frame lets the popup aggregate them: ANY frame with a
+    // video counts as "video found".
+    if (message.report) {
+      try {
+        const sent = ext.runtime.sendMessage({ type: "fv-frame-state", state });
+        if (sent && typeof sent.catch === "function") sent.catch(() => {});
+      } catch (error) {
+        // no popup is open
+      }
     }
   });
 
@@ -4037,11 +4203,11 @@ function selfCheck() {
 
   const normalized = normalizeSettings({
     mode: "invalid", strength: 150.4, outline: 1, compare: 1, quality: "invalid",
-    interaction: "invalid",
+    interaction: "invalid", bypassAt: "invalid",
   });
   if (normalized.mode !== "off" || normalized.strength !== 100 ||
       normalized.outline || normalized.compare || normalized.quality !== "high" ||
-      normalized.interaction !== "smooth") {
+      normalized.interaction !== "smooth" || normalized.bypassAt !== "2160") {
     throw new Error("selfCheck: preference normalization failed");
   }
   if (normalizeSettings({ mode: "passthrough" }).mode !== "off" ||
@@ -4280,6 +4446,132 @@ function selfCheck() {
       frameSchedulerKind(true, true) !== "video" ||
       frameSchedulerKind(true, false) !== "animation") {
     throw new Error("selfCheck: frame scheduler selected the wrong clock");
+  }
+  // Aspect fit: videoObjectRect maps the source image into the element box
+  // (object-fit + object-position), so the overlay never stretches the frame.
+  const wideFit = videoObjectRect(1600, 900, 1920, 816, "contain", "50% 50%");
+  if (Math.abs(wideFit.width - 1600) > 1e-6 || Math.abs(wideFit.height - 680) > 1e-6 ||
+      Math.abs(wideFit.y - 110) > 1e-6 || Math.abs(wideFit.x) > 1e-6) {
+    throw new Error("selfCheck: contain must letterbox a wide video");
+  }
+  const tallFit = videoObjectRect(1600, 900, 1080, 1920, "contain", "50% 50%");
+  if (Math.abs(tallFit.height - 900) > 1e-6 || Math.abs(tallFit.width - 506.25) > 1e-6 ||
+      Math.abs(tallFit.x - 546.875) > 1e-6 || Math.abs(tallFit.y) > 1e-6) {
+    throw new Error("selfCheck: contain must pillarbox a tall video");
+  }
+  const fillFit = videoObjectRect(1600, 900, 1920, 816, "fill", "50% 50%");
+  const coverFit = videoObjectRect(1600, 900, 1920, 816, "cover", "50% 50%");
+  if (fillFit.width !== 1600 || fillFit.height !== 900 ||
+      coverFit.width <= 1600 || Math.abs(coverFit.height - 900) > 1e-6) {
+    throw new Error("selfCheck: fill must stretch and cover must overscan");
+  }
+  if (!String(syncLayout).includes("videoOverlayGeometry(currentVideo, canvas)") ||
+      !String(syncLayout).includes("intrinsicSize !== lastIntrinsicSize")) {
+    throw new Error("selfCheck: layout must fit the source and re-run when it changes");
+  }
+  // Resizing the canvas clears it; a paused video emits no rVFC, so the re-fit
+  // path must repaint the held frame itself.
+  if (!String(scheduleLayoutSync).includes("redrawPausedFrame()") ||
+      !String(redrawPausedFrame).includes("currentVideo.paused") ||
+      !String(redrawPausedFrame).includes("currentVideo.readyState < 2") ||
+      !String(redrawPausedFrame).includes("draw({ newVideoFrame: true })")) {
+    throw new Error("selfCheck: a re-fit must repaint a paused video's held frame");
+  }
+  // Explicit Quality (100/75/50) locks the render scale: only Auto may adapt.
+  const keepSettings = settings;
+  settings = normalizeSettings({ ...DEFAULT_SETTINGS, mode: "rcas", quality: "high" });
+  renderScale = 1;
+  stableWindows = 0;
+  adaptRenderScale({
+    videoFps: 60, missed: 40, missedPct: 40, latePct: 90,
+    cpuMs: 500, gpuMs: 200, renderScale: 1,
+  });
+  if (renderScale !== 1 || stableWindows !== 0) {
+    throw new Error("selfCheck: explicit quality must lock the render scale");
+  }
+  settings = normalizeSettings({ ...DEFAULT_SETTINGS, mode: "rcas", quality: "auto" });
+  targetWidth = 1280;
+  targetHeight = 720;
+  adaptRenderScale({
+    videoFps: 60, missed: 40, missedPct: 40, latePct: 90,
+    cpuMs: 500, gpuMs: 200, renderScale: 1,
+  });
+  if (renderScale === 1) {
+    throw new Error("selfCheck: Auto did not react to a severe overload report");
+  }
+  renderScale = 1;
+  settings = keepSettings;
+  // Frame-less captures must not upload (see the texture-desync fix), and an
+  // errored upload must forget the size bookkeeping so it can heal.
+  if (!String(draw).includes('drawKind === "capture" && currentVideo.readyState < 2') ||
+      !String(draw).includes("while (gl.getError() !== gl.NO_ERROR)") ||
+      !String(draw).includes("textureWidth = 0;")) {
+    throw new Error("selfCheck: a capture must not upload without a current frame");
+  }
+  // A source-size change with no load event must reset temporal history and
+  // repaint; a stale-texture redraw must capture instead of being skipped.
+  const resetSrc = String(handleVideoReset);
+  if (!resetSrc.includes("event.target !== currentVideo") ||
+      !resetSrc.includes("resetFiPairState()") ||
+      !resetSrc.includes("resetVideoFrameHistory()") ||
+      !resetSrc.includes("draw({newVideoFrame:true})")) {
+    throw new Error("selfCheck: a source-size change must reset history and repaint");
+  }
+  const resetListenerSrc = String(attachDiscoveryListeners) +
+    String(detachDiscoveryListeners);
+  if (!resetListenerSrc.includes('"ratechange", "resize"') ||
+      !resetListenerSrc.includes("handleVideoReset")) {
+    throw new Error("selfCheck: the source-resize handler must stay registered");
+  }
+  if (!resetSrc.includes("isSourceBypassed()") ||
+      !resetSrc.includes("engageNativeBypass()")) {
+    throw new Error("selfCheck: a source-size change must re-evaluate the bypass");
+  }
+  if (!String(redrawPausedFrame).includes("textureStaleForVideo()") ||
+      !String(draw).includes('drawKind = "capture"') ||
+      !String(draw).includes("textureStaleForVideo()")) {
+    throw new Error("selfCheck: a stale-texture redraw must capture, not skip");
+  }
+  // Bypass upscaling: threshold math (1080/1440/2160/display/never) plus the
+  // mode gate; only FSR1/RAVU bypass, and only at or above the threshold.
+  if (bypassThresholdPx("1080") !== 1080 ||
+      bypassThresholdPx("1440") !== 1440 ||
+      bypassThresholdPx("2160") !== 2160 ||
+      bypassThresholdPx("never") !== Infinity ||
+      bypassThresholdPx("display", 1440) !== 1440 ||
+      bypassThresholdPx("display") !== Infinity ||
+      bypassThresholdPx("bogus") !== Infinity) {
+    throw new Error("selfCheck: bypass threshold math failed");
+  }
+  if (!sourceShouldBypass("rcas", 2160, 2160) ||
+      !sourceShouldBypass("ravu", 1441, 1440) ||
+      sourceShouldBypass("rcas", 1079, 1080) ||
+      sourceShouldBypass("native", 2160, 2160) ||
+      sourceShouldBypass("off", 2160, 2160) ||
+      sourceShouldBypass("rcas", 2160, Infinity) ||
+      sourceShouldBypass("rcas", 0, 1)) {
+    throw new Error("selfCheck: bypass mode/height gate failed");
+  }
+  if (normalizeSettings({}).bypassAt !== "2160" ||
+      normalizeSettings({ bypassAt: "1080" }).bypassAt !== "1080" ||
+      normalizeSettings({ bypassAt: "display" }).bypassAt !== "display" ||
+      normalizeSettings({ bypassAt: "never" }).bypassAt !== "never") {
+    throw new Error("selfCheck: bypass preference migration failed");
+  }
+  // Ported helpers must be reachable at module scope: a merge that nests one
+  // inside another function still parses but throws only at call time.
+  for (const helper of [bypassThresholdPx, sourceShouldBypass, isSourceBypassed,
+    activeBypassThreshold, engageNativeBypass, textureStaleForVideo, redrawPausedFrame,
+    videoObjectPosition, videoObjectRect, videoOverlayGeometry]) {
+    if (typeof helper !== "function") {
+      throw new Error("selfCheck: ported helper is not defined at module scope");
+    }
+  }
+  if (!String(canRender).includes("!isSourceBypassed()") ||
+      !String(activateRenderer).includes("isSourceBypassed()") ||
+      !String(handleVideoReset).includes("isSourceBypassed()") ||
+      !String(snapshot).includes("bypassed: isSourceBypassed()")) {
+    throw new Error("selfCheck: bypass must gate rendering, activation and snapshot");
   }
   const shaderFixture = "step1: String.raw`um`,\ncompose: String.raw`dois`,";
   if (extractRavuShader(shaderFixture, "step1") !== "um" ||

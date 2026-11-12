@@ -24,7 +24,7 @@
    this.whenLost=device.lost.then(info=>{this.lost=true;return new Error(info.message||'Neural device lost');});
   }
   reset(){this.last=null;this.generation++;}
-  _free(){this.runtime?.destroy();this.runtime=null;for(const t of this.pool)t.texture.destroy();this.pool=[];this.output?.destroy();this.output=null;try{this.context?.unconfigure();}catch{}this.last=null;}
+  _free(){this.runtime?.destroy();this.runtime=null;for(const t of this.pool)t.texture.destroy();this.pool=[];this.output?.destroy();this.output=null;try{this.context?.unconfigure();}catch{}this.last=null;this.snapshot=null;this.snapshotContext=null;}
   _resize(width,height){
    if(this.initializing||this.busy)return;
    const generation=++this.generation;
@@ -51,17 +51,47 @@
     finally{const validation=await device.popErrorScope().catch(error=>error);if(validation){this.error=validation.message;this._free();}this.initializing=null;}
    })();
   }
+  // Firefox's GPUCopyExternalImageSource union accepts only ImageBitmap,
+  // HTMLImageElement, HTMLCanvasElement and OffscreenCanvas -- an
+  // HTMLVideoElement is rejected before any copy happens. Snapshot the decoded
+  // frame into a reused 2D canvas first. drawImage(video) is synchronous, so it
+  // still captures this callback's frame rather than a later one.
+  _snapshot(video,width,height){
+   let canvas=this.snapshot;
+   if(!canvas||canvas.width!==width||canvas.height!==height){
+    canvas=this.snapshot=new OffscreenCanvas(width,height);
+    const context=canvas.getContext('2d',{alpha:false});
+    if(!context)throw new Error('Firefox could not create the 2D snapshot canvas needed to upload video frames to WebGPU');
+    this.snapshotContext=context;
+   }
+   try{
+    this.snapshotContext.drawImage(video,0,0,width,height);
+   }catch(error){
+    if(error?.name==='SecurityError')throw new Error('Firefox cannot read this cross-origin video into WebGPU (tainted canvas); neural interpolation needs CORS-enabled video');
+    throw error;
+   }
+   return canvas;
+  }
   submit(video,{phase=.5,serial,skip=false,valid=()=>true,debug=0}={}){
    if(this.destroyed||this.lost)throw new Error('Neural backend closed');
    if(this.error)throw new Error(this.error);
+   if(!video||video.readyState<2){this.stats.buffering++;return null;}
    const w=video.videoWidth,h=video.videoHeight;
    if(w!==this.width||h!==this.height||!this.runtime){this._resize(w,h);this.stats.buffering++;return null;}
    if(this.initializing){this.stats.buffering++;return null;}
    const current=this.pool.find(p=>p!==this.last&&!p.locked);
    if(!current){this.stats.busy++;return null;}
-   // copyExternalImageToTexture snapshots this callback's decoded frame. It is
-   // not deferred until after an await, when HTMLVideoElement may have advanced.
-   this.device.queue.copyExternalImageToTexture({source:video},{texture:current.texture,colorSpace:'srgb'},[w,h]);
+   // The canvas bridge above is the only path: Firefox rejects video elements
+   // outright, and Chromium accepts OffscreenCanvas too, so one code path runs
+   // everywhere and the snapshot stays on this callback's decoded frame.
+   const frame=this._snapshot(video,w,h);
+   try{
+    this.device.queue.copyExternalImageToTexture({source:frame},{texture:current.texture,colorSpace:'srgb'},[w,h]);
+   }catch(error){
+    // A cross-origin video taints the snapshot canvas; Firefox refuses the copy.
+    if(error?.name==='SecurityError')throw new Error('Firefox cannot read this cross-origin video into WebGPU (tainted canvas); neural interpolation needs CORS-enabled video');
+    throw error;
+   }
    const previous=this.last;this.last=current;
    if(!previous||skip){this.stats.skipped++;return null;}
    if(this.busy){this.stats.busy++;return null;}

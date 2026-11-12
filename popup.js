@@ -11,8 +11,10 @@ const fiSceneCut = $("#fiSceneCut"), fiHalfLuma = $("#fiHalfLuma"), fiBlockMatch
 const toggle = $("#toggle"), reload = $("#reload"), hint = $("#hint"), healthEl = $("#health");
 const saveDiagnostics = $("#saveDiagnostics");
 const modeChips = $$("#modeChips .chip"), qualityChips = $$("#qualityChips .chip");
+const bypassChips = $$("#bypassChips .chip");
 const interactionChips = $$("#interactionChips .chip"), presetChips = $$("#presetChips .chip");
-const allControls = [...modeChips, ...qualityChips, ...interactionChips, ...presetChips,
+const sourceQuality = $("#source");
+const allControls = [...modeChips, ...qualityChips, ...bypassChips, ...interactionChips, ...presetChips,
   strength, outline, compare, protectNoise, fiInfra, fiEngine, fiProfile, fiDebug,
   fiSceneCut, fiHalfLuma, fiBlockMatch, toggle, saveDiagnostics];
 
@@ -76,6 +78,7 @@ function isPresenting(state) {
     state.videoPaused !== true && state.videoEnded !== true;
 }
 function healthSummary(state) {
+  if (state.bypassed === true) return {text:"Bypassed",tone:"off"};
   if (state.settings?.mode === "off") return {text:"Inactive",tone:"off"};
   if (!isPresenting(state)) return {text:"—",tone:"off"};
   const m = state.metrics || {};
@@ -92,9 +95,11 @@ function renderControls(settings) {
   const enabled = settings.fiInfra === true;
   setPressed(modeChips,"mode",mode);
   setPressed(qualityChips,"quality",settings.quality);
+  setPressed(bypassChips,"bypass",settings.bypassAt);
   setPressed(interactionChips,"interaction",settings.interaction);
   setDisabled(modeChips,false);
   setDisabled(qualityChips,!renderOn);
+  setDisabled(bypassChips,false);
   setDisabled(interactionChips,!renderOn);
   setDisabled(presetChips,!spatialOn);
   $("#modeHint").textContent = modeHints[mode] || modeHints.off;
@@ -205,6 +210,18 @@ function renderInterpolation(state) {
   $("#fiRates").textContent = isPresenting(state) ? `${fixed(fi.realPerSec ?? metrics.fps)} / ${fixed(fi.midPerSec ?? metrics.midFps)} per s` : "—";
 }
 
+// Human-readable threshold for the status line; "display" resolves to the
+// screen height the content script reports, so the chip and the reason match.
+function bypassOptionLabel(value, threshold) {
+  if (value === "2160") return "4K";
+  if (value === "1080") return "1080p";
+  if (value === "1440") return "1440p";
+  if (value === "display") {
+    return threshold > 0 ? `Display res (${threshold}px)` : "Display res";
+  }
+  return "Never";
+}
+
 function render(state) {
   if (!state || !state.settings) throw new Error("Invalid video status");
   currentState = state;
@@ -229,6 +246,15 @@ function render(state) {
       description = `${modeNames[settings.mode] || "Video"}${size}${measured ? "" : " · measuring playback"}`;
     }
   }
+  // A source at or above the bypass threshold is presented natively: no
+  // canvas, no GL work. Say so instead of reporting an idle/blank pipeline.
+  const bypassed = state.bypassed === true;
+  if (bypassed) {
+    title = "Bypassed";
+    tone = "off";
+    description = `Bypassed · source ${state.sourceWidth}×${state.sourceHeight} ≥ ` +
+      `${bypassOptionLabel(settings.bypassAt, state.bypassThreshold)} · native`;
+  }
   statusChip.dataset.tone = tone;
   setText(label,title);
   detail.textContent = description;
@@ -237,7 +263,10 @@ function render(state) {
   const health = healthSummary(state);
   healthEl.textContent = health.text;
   healthEl.dataset.tone = health.tone;
-  const presenting = isPresenting(state);
+  const presenting = isPresenting(state) && !bypassed;
+  sourceQuality.textContent = state.sourceWidth && state.sourceHeight
+    ? `${state.sourceWidth}×${state.sourceHeight}${bypassed ? " · bypassed" : ""}`
+    : "—";
   $("#sourceFps").textContent = presenting && finite(metrics.videoFps) ? `${fixed(metrics.videoFps)} fps` : "—";
   $("#fps").textContent = presenting && finite(metrics.fps) && finite(metrics.midFps) ? `${fixed(number(metrics.fps)+number(metrics.midFps))} frames/s` : "—";
   $("#renderScale").textContent = finite(metrics.renderScale) ? `${Math.round(number(metrics.renderScale)*100)}%` : "—";
@@ -247,13 +276,75 @@ function render(state) {
   $("#cpu").textContent = finite(metrics.cpuMs) ? `${fixed(metrics.cpuMs,2)} ms` : "—";
   $("#gpu").textContent = finite(metrics.gpuMs) ? `${fixed(metrics.gpuMs,2)} ms` : (metrics.gpuSupported ? "Measuring…" : "Timer unavailable");
   $("#decoder").textContent = finite(metrics.decoderMs) ? `${fixed(metrics.decoderMs,2)} ms` : "n/a";
-  hint.textContent = settings.fiInfra && number(state.fi?.presentationDelayMs) > 0 ?
+  hint.textContent = bypassed ?
+    "This source is at or above the bypass threshold — shown natively with no processing." :
+    settings.fiInfra && number(state.fi?.presentationDelayMs) > 0 ?
     `Saved across tabs · ${milliseconds(state.fi.presentationDelayMs)} motion delay.` :
     "Saved settings apply across tabs. Video stays on this device.";
 }
 
+// The content script runs in every frame (manifest: all_frames). A frame-less
+// tabs.sendMessage reaches all frames, but Firefox resolves with only ONE of the
+// answers ("if several frames respond ... the promise is resolved to one of
+// answers"), so the frame that owns the video can lose the race against a
+// video-less top frame. Every frame therefore also pushes its own state here
+// over runtime messaging, and the popup merges everything it receives.
+const frameReports = [];
+
+ext.runtime.onMessage.addListener((message) => {
+  if (message && message.type === "fv-frame-state" && message.state) {
+    frameReports.push(message.state);
+  }
+});
+
+function takeFrameReports() {
+  const reports = frameReports.slice();
+  frameReports.length = 0;
+  return reports;
+}
+
+function gatherFrameStates(response) {
+  if (response === undefined || response === null) return [];
+  const list = Array.isArray(response) ? response : [response];
+  return list.filter((state) => state && typeof state === "object");
+}
+
+// Prefer the frame that owns a video, then a frame that is rendering, then the
+// frame with the largest canvas (the real player over a stray/hidden video).
+// ANY frame having a video counts as "video found".
+function pickBestState(states) {
+  let best = null;
+  let bestScore = -1;
+  let bestArea = -1;
+  for (const state of states) {
+    const score = (state.hasVideo ? 2 : 0) + (state.status === "ok" ? 1 : 0);
+    const area = (Number(state.canvasWidth) || 0) * (Number(state.canvasHeight) || 0);
+    if (score > bestScore || (score === bestScore && area > bestArea)) {
+      best = state;
+      bestScore = score;
+      bestArea = area;
+    }
+  }
+  return best;
+}
+
 async function send(type, settings) {
-  return ext.tabs.sendMessage(tabId,{type,settings},{frameId:0});
+  takeFrameReports(); // drop reports left over from an earlier request
+  let response = null;
+  let failure = null;
+  try {
+    response = await ext.tabs.sendMessage(tabId, { type, settings, report: true });
+  } catch (error) {
+    failure = error;
+  }
+  if (type === "fv-status") {
+    // give every frame time to deliver its pushed report
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  }
+  const states = (response ? gatherFrameStates(response) : []).concat(takeFrameReports());
+  const state = pickBestState(states);
+  if (!state) throw failure || new Error("No frame responded");
+  return state;
 }
 function unavailable() {
   controlsLocked = true;
@@ -326,6 +417,7 @@ for (const chip of modeChips) chip.addEventListener("click",() => {
   updateSettings(patch);
 });
 for (const chip of qualityChips) chip.addEventListener("click",() => updateSettings({quality:chip.dataset.quality}));
+for (const chip of bypassChips) chip.addEventListener("click",() => updateSettings({bypassAt:chip.dataset.bypass}));
 for (const chip of interactionChips) chip.addEventListener("click",() => updateSettings({interaction:chip.dataset.interaction}));
 for (const chip of presetChips) chip.addEventListener("click",() => updateSettings({strength:number(chip.dataset.strength)}));
 strength.addEventListener("pointerdown",() => {draggingStrength = true;});
